@@ -1,0 +1,19 @@
+# Rust
+target/
+Cargo.lock
+
+# Environnement
+.env
+
+# Données runtime
+/var/my-cloud/
+/tmp/container/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db

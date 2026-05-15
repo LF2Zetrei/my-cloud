@@ -1,0 +1,10 @@
+[workspace]
+members = ["common",
+    "network", "observability", "orchestrator", 
+    "runtime", "storage",
+    "vpn",
+]
+resolver = "2"
+
+[workspace.dependencies]
+dotenvy = "0.15"
