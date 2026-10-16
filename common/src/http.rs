@@ -17,14 +17,30 @@ pub struct HttpRequest {
 
 pub fn send_response(stream: &mut TcpStream, status: &str, body: &str) -> Result<()> {
     let header = format!(
-        "HTTP/1.1 {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n",
+        "HTTP/1.1 {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS\r\n\
+         Access-Control-Allow-Headers: Authorization, Content-Type\r\n\
+         \r\n",
         status,
         body.len()
     );
-
     let response = format!("{}{}", header, body);
     stream.write_all(response.as_bytes())?;
     Ok(())
+}
+
+/// Renvoie une erreur HTTP adaptée au type d'erreur, pour que le client
+/// reçoive toujours une réponse au lieu d'une connexion fermée sans rien.
+pub fn send_error(stream: &mut TcpStream, err: &CloudError) -> Result<()> {
+    let status = match err {
+        CloudError::Parse(_) | CloudError::Json(_) => "400 Bad Request",
+        CloudError::NotFound(_) => "404 Not Found",
+        _ => "500 Internal Server Error",
+    };
+    send_response(stream, status, &err.to_string())
 }
 
 pub fn parse_request(stream: &TcpStream) -> Result<HttpRequest> {
@@ -49,13 +65,17 @@ pub fn parse_request(stream: &TcpStream) -> Result<HttpRequest> {
         if line.is_empty() {
             break;
         }
-        if let Some((key, value)) = line.split_once(": ") {
-            if key == "Content-Length" {
+        // Les noms de headers HTTP sont insensibles à la casse : on les stocke en minuscules
+        // (Node/Next.js les envoie en minuscules, curl en "Title-Case").
+        if let Some((key, value)) = line.split_once(':') {
+            let key = key.trim().to_ascii_lowercase();
+            let value = value.trim();
+            if key == "content-length" {
                 content_length = value
                     .parse::<usize>()
                     .map_err(|e| CloudError::Parse(e.to_string()))?;
             }
-            headers.insert(key.to_string(), value.to_string());
+            headers.insert(key, value.to_string());
         }
     }
 
@@ -72,7 +92,7 @@ pub fn parse_request(stream: &TcpStream) -> Result<HttpRequest> {
 }
 
 pub fn check_auth(req: &HttpRequest, token: &str) -> bool {
-    let auth = match req.headers.get("Authorization") {
+    let auth = match req.headers.get("authorization") {
         Some(a) => a,
         None => return false,
     };
@@ -83,6 +103,7 @@ pub fn check_auth(req: &HttpRequest, token: &str) -> bool {
 
 pub fn is_protected(method: &str, path: &str) -> bool {
     match (method, path) {
+        ("OPTIONS", _) => false,
         (_, "/health") => false,
         (_, "/metrics") => false,
         ("GET", _) => false,

@@ -1,6 +1,7 @@
 use common::error::CloudError;
 use common::error::Result;
 use common::http::parse_request;
+use common::http::send_error;
 use common::http::send_response;
 use common::models::ContainerRepository;
 use common::models::FileRepository;
@@ -18,25 +19,27 @@ struct ProcessMetrics {
     memory_rss_kb: u64,
 }
 
-fn handle_request(mut stream: TcpStream) -> Result<()> {
-    let req = parse_request(&mut stream)?;
+fn handle_request(stream: &mut TcpStream) -> Result<()> {
+    let req = parse_request(stream)?;
 
-    if req.path == "/health" {
-        send_response(&mut stream, "200 OK", "OK")?;
+    if req.method == "OPTIONS" {
+        send_response(stream, "200 OK", "")?;
+    } else if req.path == "/health" {
+        send_response(stream, "200 OK", "OK")?;
     } else if req.path == "/metrics" {
         let metrics = collect_metrics()?;
         let json = serde_json::to_string(&metrics)?;
-        send_response(&mut stream, "200 OK", &json)?;
+        send_response(stream, "200 OK", &json)?;
     } else if let Some(container_id) = req.path.strip_prefix("/metrics/") {
         match collect_process_metrics(container_id) {
             Ok(m) => {
                 let json = serde_json::to_string(&m)?;
-                send_response(&mut stream, "200 OK", &json)?;
+                send_response(stream, "200 OK", &json)?;
             }
-            Err(e) => send_response(&mut stream, "404 Not Found", &e.to_string())?,
+            Err(e) => send_response(stream, "404 Not Found", &e.to_string())?,
         }
     } else {
-        send_response(&mut stream, "404 Not Found", "Not found")?;
+        send_response(stream, "404 Not Found", "Not found")?;
     }
     Ok(())
 }
@@ -79,7 +82,8 @@ fn read_uptime() -> Result<u64> {
     Ok(first_number as u64)
 }
 
-fn read_cpu() -> Result<f64> {
+/// Lit la ligne agrégée "cpu" de /proc/stat : (jiffies totaux, jiffies idle).
+fn read_cpu_times() -> Result<(u64, u64)> {
     let content = std::fs::read_to_string("/proc/stat")?;
     let line = content
         .lines()
@@ -91,10 +95,24 @@ fn read_cpu() -> Result<f64> {
         .skip(1)
         .map(|v| v.parse::<u64>().unwrap_or(0))
         .collect();
-    let idle = values.get(3).copied().unwrap_or(0);
-    let total = values.iter().sum::<u64>();
-    let used = total - idle;
-    Ok((used as f64 / total as f64) * 100.0)
+    // idle + iowait
+    let idle = values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0);
+    Ok((values.iter().sum::<u64>(), idle))
+}
+
+/// Les compteurs de /proc/stat sont cumulés depuis le boot : deux échantillons
+/// à 100 ms d'intervalle donnent l'utilisation actuelle et non une moyenne depuis le boot.
+fn read_cpu() -> Result<f64> {
+    let (total1, idle1) = read_cpu_times()?;
+    std::thread::sleep(Duration::from_millis(100));
+    let (total2, idle2) = read_cpu_times()?;
+
+    let delta_total = total2.saturating_sub(total1) as f64;
+    let delta_idle = idle2.saturating_sub(idle1) as f64;
+    if delta_total == 0.0 {
+        return Ok(0.0);
+    }
+    Ok(((delta_total - delta_idle) / delta_total) * 100.0)
 }
 
 fn read_proc_stat_jiffies(pid: u32) -> Result<u64> {
@@ -191,10 +209,11 @@ fn main() -> Result<()> {
     let listener = TcpListener::bind(&observability_addr)?;
     println!("[OBSERVABILITY] Démarrage sur {}", observability_addr);
     for stream in listener.incoming() {
-        let stream = stream?;
+        let mut stream = stream?;
         std::thread::spawn(move || {
-            if let Err(e) = handle_request(stream) {
+            if let Err(e) = handle_request(&mut stream) {
                 eprintln!("Request error: {}", e);
+                let _ = send_error(&mut stream, &e);
             }
         });
     }

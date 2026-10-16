@@ -44,21 +44,30 @@ impl ObjectStore {
         })
     }
 
+    /// Chemin du fichier d'une clé. Les clés sont des noms plats : on refuse
+    /// les séparateurs et ".." pour qu'une clé ne puisse pas sortir de data/.
+    fn data_path(&self, key: &str) -> Result<String> {
+        if key.is_empty() || key == "." || key == ".." || key.contains(['/', '\\', '\0']) {
+            return Err(CloudError::Parse(format!("clé invalide : {:?}", key)));
+        }
+        Ok(format!("{}/data/{}", self.base_path, key))
+    }
+
     pub fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        let file_path = format!("{}/data/{}", self.base_path, key);
-        std::fs::write(file_path, data)?;
+        std::fs::write(self.data_path(key)?, data)?;
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let file_path = format!("{}/data/{}", self.base_path, key);
-        std::fs::read(file_path).ok()
+        std::fs::read(self.data_path(key).ok()?).ok()
     }
 
     pub fn delete(&self, key: &str) -> Result<()> {
-        let file_path = format!("{}/data/{}", self.base_path, key);
-        std::fs::remove_file(file_path)?;
-        Ok(())
+        let file_path = self.data_path(key)?;
+        std::fs::remove_file(&file_path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => CloudError::NotFound(key.to_string()),
+            _ => CloudError::Io(e),
+        })
     }
 
     pub fn list(&self) -> Result<Vec<String>> {
@@ -202,6 +211,8 @@ impl ContainerBuilder {
 
 pub struct FileRepository {
     path: String,
+    // Sérialise les cycles load → modification → save entre threads
+    lock: Mutex<()>,
 }
 
 impl FileRepository {
@@ -218,6 +229,7 @@ impl FileRepository {
 
         Ok(FileRepository {
             path: path.to_string(),
+            lock: Mutex::new(()),
         })
     }
 
@@ -225,6 +237,10 @@ impl FileRepository {
         let content = std::fs::read_to_string(&self.path)?;
         let containers = serde_json::from_str(&content)?;
         Ok(containers)
+    }
+
+    fn guard(&self) -> Result<std::sync::MutexGuard<'_, ()>> {
+        self.lock.lock().map_err(|e| CloudError::Parse(e.to_string()))
     }
 
     pub fn save(&self, containers: &Vec<Container>) -> Result<()> {
@@ -236,42 +252,44 @@ impl FileRepository {
 
 impl ContainerRepository for FileRepository {
     fn add(&self, container: Container) -> Result<()> {
+        let _g = self.guard()?;
         let mut containers = self.load()?;
         containers.push(container);
-        let _ = self.save(&containers);
-        Ok(())
+        self.save(&containers)
     }
 
     fn list(&self) -> Result<Vec<Container>> {
+        let _g = self.guard()?;
         self.load()
     }
 
     fn get(&self, id: &str) -> Result<Option<Container>> {
+        let _g = self.guard()?;
         Ok(self.load()?.into_iter().find(|c| c.id == id))
     }
 
     fn delete(&self, id: &str) -> Result<()> {
+        let _g = self.guard()?;
         let mut containers = self.load()?;
         containers.retain(|c| c.id != id);
-        let _ = self.save(&containers);
-        Ok(())
+        self.save(&containers)
     }
 
     fn update_status(&self, id: &str, status: ContainerStatus) -> Result<()> {
+        let _g = self.guard()?;
         let mut containers = self.load()?;
         if let Some(c) = containers.iter_mut().find(|c| c.id == id) {
             c.status = status;
         }
-        self.save(&containers)?;
-        Ok(())
+        self.save(&containers)
     }
 
     fn update_pid(&self, id: &str, pid: Option<u32>) -> Result<()> {
+        let _g = self.guard()?;
         let mut containers = self.load()?;
         if let Some(c) = containers.iter_mut().find(|c| c.id == id) {
             c.pid = pid;
         }
-        let _ = self.save(&containers)?;
-        Ok(())
+        self.save(&containers)
     }
 }
